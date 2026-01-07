@@ -10,6 +10,7 @@ from app.models import (
 )
 from app.recommender import recommender_engine
 from app.cf_recommender import cf_recommender
+from app.cold_start import cold_start_handler
 from typing import List
 import json
 
@@ -126,6 +127,44 @@ def get_recommendations(request: RecommendationRequest):
         if not programs:
             return []
 
+        feedback_history = supabase.table("feedback").select("*").eq("student_id", request.student_id).execute()
+        has_feedback = len(feedback_history.data) > 0
+
+        if not has_feedback:
+            cold_start_recs = cold_start_handler.recommend_for_new_user(
+                student_data,
+                top_k=request.top_k
+            )
+
+            response_recommendations = []
+            for program, score, explanation in cold_start_recs:
+                rec_data = {
+                    "student_id": request.student_id,
+                    "program_id": program['id'],
+                    "score": score,
+                    "explanation": explanation,
+                    "algorithm": "cold_start"
+                }
+
+                try:
+                    supabase.table("recommendations").insert(rec_data).execute()
+                except Exception:
+                    pass
+
+                response_recommendations.append(
+                    Recommendation(
+                        program_id=program['id'],
+                        program_name=program['name'],
+                        program_description=program['description'],
+                        score=score,
+                        explanation=explanation,
+                        tags=program.get('tags', []),
+                        skills=program.get('skills', [])
+                    )
+                )
+
+            return response_recommendations
+
         recommender_engine.fit(programs)
 
         content_recs = recommender_engine.recommend(
@@ -133,7 +172,6 @@ def get_recommendations(request: RecommendationRequest):
             top_k=request.top_k
         )
 
-        # Get CF scores (if available) and combine with content scores
         try:
             cf_scores = cf_recommender.recommend_for_student(request.student_id, programs, top_k=request.top_k)
         except Exception:
@@ -225,5 +263,136 @@ def get_student_recommendations(student_id: str):
         ).eq("student_id", student_id).order("created_at", desc=True).limit(10).execute()
 
         return {"recommendations": result.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/engagement")
+def get_engagement_metrics():
+    try:
+        recommendations_result = supabase.table("recommendations").select("*").execute()
+        feedback_result = supabase.table("feedback").select("*").execute()
+
+        total_recommendations = len(recommendations_result.data)
+
+        if total_recommendations == 0:
+            return {
+                "total_recommendations": 0,
+                "total_clicks": 0,
+                "total_accepts": 0,
+                "ctr": 0.0,
+                "acceptance_rate": 0.0,
+                "avg_rating": 0.0,
+                "num_ratings": 0,
+                "unique_students": 0,
+                "unique_programs": 0
+            }
+
+        feedback_data = feedback_result.data
+
+        total_clicks = sum(1 for f in feedback_data if f.get('clicked', False))
+        total_accepts = sum(1 for f in feedback_data if f.get('accepted', False))
+
+        ratings = [f['rating'] for f in feedback_data if f.get('rating') is not None]
+        avg_rating = sum(ratings) / len(ratings) if ratings else 0.0
+
+        ctr = (total_clicks / total_recommendations) * 100
+        acceptance_rate = (total_accepts / total_recommendations) * 100
+
+        unique_students = len(set(r['student_id'] for r in recommendations_result.data))
+        unique_programs = len(set(r['program_id'] for r in recommendations_result.data))
+
+        return {
+            "total_recommendations": total_recommendations,
+            "total_clicks": total_clicks,
+            "total_accepts": total_accepts,
+            "ctr": round(ctr, 2),
+            "acceptance_rate": round(acceptance_rate, 2),
+            "avg_rating": round(avg_rating, 2),
+            "num_ratings": len(ratings),
+            "unique_students": unique_students,
+            "unique_programs": unique_programs
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/program-performance")
+def get_program_performance():
+    try:
+        recommendations_result = supabase.table("recommendations").select("*").execute()
+        feedback_result = supabase.table("feedback").select("*").execute()
+        programs_result = supabase.table("programs").select("*").execute()
+
+        program_stats = {}
+        for prog in programs_result.data:
+            program_stats[prog['id']] = {
+                "program_id": prog['id'],
+                "program_name": prog['name'],
+                "times_recommended": 0,
+                "clicks": 0,
+                "accepts": 0,
+                "avg_rating": 0.0,
+                "num_ratings": 0
+            }
+
+        for rec in recommendations_result.data:
+            prog_id = rec['program_id']
+            if prog_id in program_stats:
+                program_stats[prog_id]['times_recommended'] += 1
+
+        for feedback in feedback_result.data:
+            prog_id = feedback['program_id']
+            if prog_id in program_stats:
+                if feedback.get('clicked', False):
+                    program_stats[prog_id]['clicks'] += 1
+                if feedback.get('accepted', False):
+                    program_stats[prog_id]['accepts'] += 1
+                if feedback.get('rating') is not None:
+                    program_stats[prog_id]['num_ratings'] += 1
+                    current_avg = program_stats[prog_id]['avg_rating']
+                    count = program_stats[prog_id]['num_ratings']
+                    program_stats[prog_id]['avg_rating'] = (
+                        (current_avg * (count - 1) + feedback['rating']) / count
+                    )
+
+        for prog_id in program_stats:
+            stats = program_stats[prog_id]
+            if stats['times_recommended'] > 0:
+                stats['ctr'] = round((stats['clicks'] / stats['times_recommended']) * 100, 2)
+                stats['acceptance_rate'] = round((stats['accepts'] / stats['times_recommended']) * 100, 2)
+            else:
+                stats['ctr'] = 0.0
+                stats['acceptance_rate'] = 0.0
+            stats['avg_rating'] = round(stats['avg_rating'], 2)
+
+        sorted_programs = sorted(
+            program_stats.values(),
+            key=lambda x: x['times_recommended'],
+            reverse=True
+        )
+
+        return {"programs": sorted_programs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/dashboard")
+def get_analytics_dashboard():
+    try:
+        engagement = get_engagement_metrics()
+        program_performance = get_program_performance()
+
+        top_programs = sorted(
+            program_performance['programs'],
+            key=lambda x: x['acceptance_rate'],
+            reverse=True
+        )[:5]
+
+        return {
+            "engagement": engagement,
+            "top_performing_programs": top_programs,
+            "total_programs": len(program_performance['programs'])
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
